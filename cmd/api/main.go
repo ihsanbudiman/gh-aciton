@@ -11,6 +11,7 @@ import (
 
 	"github.com/ihsanbudiman/gh-action/internal/config"
 	"github.com/ihsanbudiman/gh-action/internal/handler"
+	"github.com/ihsanbudiman/gh-action/internal/migration"
 	"github.com/ihsanbudiman/gh-action/internal/repository/postgres"
 	"github.com/ihsanbudiman/gh-action/internal/service"
 )
@@ -31,6 +32,16 @@ func main() {
 	defer db.Close()
 
 	log.Println("Connected to database")
+
+	// Run migrations
+	migrationsDir := os.Getenv("MIGRATIONS_DIR")
+	if migrationsDir == "" {
+		migrationsDir = "migrations"
+	}
+	if err := migration.Run(ctx, db, migrationsDir); err != nil {
+		log.Fatalf("Failed to run migrations: %v", err)
+	}
+	log.Println("Migrations completed successfully")
 
 	// Initialize layers (dependency injection)
 	userRepo := postgres.NewUserRepository(db)
