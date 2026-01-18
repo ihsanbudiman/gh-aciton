@@ -1,0 +1,265 @@
+name: GLM AI Code Review
+on:
+  # Trigger on pull request events
+  pull_request:
+    types: [opened, synchronize, reopened]
+  
+  # Trigger when someone comments @glm-review on a PR
+  issue_comment:
+    types: [created]
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+jobs:
+  # Job for automatic review on PR creation/update
+  auto-review:
+    name: Automatic Code Review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Get changed files
+        id: changed-files
+        run: |
+          git fetch origin ${{ github.base_ref }} --depth=1
+          
+          # Get list of changed files
+          CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | head -20)
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          # Get the diff content (limited to 8000 chars to avoid token limits)
+          DIFF=$(git diff origin/${{ github.base_ref }}...HEAD -- '*.js' '*.ts' '*.py' '*.go' '*.java' '*.rb' '*.php' '*.jsx' '*.tsx' '*.vue' '*.svelte' | head -c 8000)
+          
+          # Save diff to file for later use
+          echo "$DIFF" > /tmp/pr_diff.txt
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Run GLM Code Review
+        id: review
+        env:
+          ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+        run: |
+          cat << 'EOF' > review.mjs
+          import https from 'https';
+          import fs from 'fs';
+          const diff = fs.readFileSync('/tmp/pr_diff.txt', 'utf8');
+          const apiKey = process.env.ZHIPU_API_KEY;
+          if (!apiKey) {
+            console.error('Error: ZHIPU_API_KEY is not set');
+            process.exit(1);
+          }
+          if (!diff.trim()) {
+            console.log('No code changes detected in supported file types.');
+            process.exit(0);
+          }
+          const systemPrompt = `You are an expert code reviewer. Analyze code changes and provide:
+          1. 🐛 **Potential Bugs**: Issues that could cause runtime errors
+          2. 🔒 **Security Concerns**: Vulnerabilities or security risks
+          3. ⚡ **Performance**: Inefficiencies or optimization opportunities
+          4. 📝 **Code Quality**: Readability, maintainability, best practices
+          5. ✅ **What's Good**: Positive aspects of the changes
+          Be concise and actionable. Use markdown formatting.
+          If the code looks good, say so briefly.`;
+          const userPrompt = `Please review these code changes:\n\n\`\`\`diff\n${diff}\n\`\`\``;
+          const data = JSON.stringify({
+            model: "glm-4-flash",
+            messages: [
+              { role: "system", content: systemPrompt },
+              { role: "user", content: userPrompt }
+            ],
+            temperature: 0.3,
+            max_tokens: 2000
+          });
+          const options = {
+            hostname: 'open.bigmodel.cn',
+            path: '/api/paas/v4/chat/completions',
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${apiKey}`,
+              'Content-Length': Buffer.byteLength(data)
+            }
+          };
+          const req = https.request(options, (res) => {
+            let body = '';
+            res.on('data', (chunk) => body += chunk);
+            res.on('end', () => {
+              try {
+                if (res.statusCode !== 200) {
+                  console.error(`API Error (${res.statusCode}):`, body);
+                  process.exit(1);
+                }
+                const response = JSON.parse(body);
+                if (response.choices && response.choices[0]) {
+                  console.log(response.choices[0].message.content);
+                } else {
+                  console.error('Unexpected response format:', body);
+                  process.exit(1);
+                }
+              } catch (e) {
+                console.error('Failed to parse response:', e.message);
+                process.exit(1);
+              }
+            });
+          });
+          req.on('error', (e) => {
+            console.error('Request failed:', e.message);
+            process.exit(1);
+          });
+          req.write(data);
+          req.end();
+          EOF
+          
+          node review.mjs > review_output.txt 2>&1 || true
+          cat review_output.txt
+      - name: Post review comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let review = '';
+            
+            try {
+              review = fs.readFileSync('review_output.txt', 'utf8');
+            } catch (e) {
+              review = 'Unable to generate review. Please check the workflow logs.';
+            }
+            
+            if (!review.trim()) {
+              review = 'No code changes detected in supported file types.';
+            }
+            
+            const body = `## 🤖 GLM AI Code Review
+            ${review}
+            ---
+            <sub>Powered by GLM-4 | Reply with \`@glm-review\` to request a new review</sub>`;
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+  # Job for on-demand review via @glm-review comment
+  on-demand-review:
+    name: On-Demand Code Review
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '@glm-review')
+    
+    steps:
+      - name: Get PR details
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+            core.setOutput('head_sha', pr.data.head.sha);
+            core.setOutput('base_ref', pr.data.base.ref);
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.pr.outputs.head_sha }}
+          fetch-depth: 0
+      - name: Get diff
+        run: |
+          git fetch origin ${{ steps.pr.outputs.base_ref }} --depth=1
+          git diff origin/${{ steps.pr.outputs.base_ref }}...HEAD -- '*.js' '*.ts' '*.py' '*.go' '*.java' '*.rb' '*.php' '*.jsx' '*.tsx' '*.vue' '*.svelte' | head -c 8000 > /tmp/pr_diff.txt
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Run GLM Code Review
+        env:
+          ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+        run: |
+          cat << 'EOF' > review.mjs
+          import https from 'https';
+          import fs from 'fs';
+          const diff = fs.readFileSync('/tmp/pr_diff.txt', 'utf8');
+          const apiKey = process.env.ZHIPU_API_KEY;
+          if (!apiKey) {
+            console.error('Error: ZHIPU_API_KEY is not set');
+            process.exit(1);
+          }
+          if (!diff.trim()) {
+            console.log('No code changes detected in supported file types.');
+            process.exit(0);
+          }
+          const systemPrompt = `You are an expert code reviewer. Analyze code changes and provide:
+          1. 🐛 **Potential Bugs**: Issues that could cause runtime errors
+          2. 🔒 **Security Concerns**: Vulnerabilities or security risks
+          3. ⚡ **Performance**: Inefficiencies or optimization opportunities
+          4. 📝 **Code Quality**: Readability, maintainability, best practices
+          5. ✅ **What's Good**: Positive aspects of the changes
+          Be concise and actionable. Use markdown formatting.`;
+          const userPrompt = `Please review these code changes:\n\n\`\`\`diff\n${diff}\n\`\`\``;
+          const data = JSON.stringify({
+            model: "glm-4-flash",
+            messages: [
+              { role: "system", content: systemPrompt },
+              { role: "user", content: userPrompt }
+            ],
+            temperature: 0.3,
+            max_tokens: 2000
+          });
+          const options = {
+            hostname: 'open.bigmodel.cn',
+            path: '/api/paas/v4/chat/completions',
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${apiKey}`,
+              'Content-Length': Buffer.byteLength(data)
+            }
+          };
+          const req = https.request(options, (res) => {
+            let body = '';
+            res.on('data', (chunk) => body += chunk);
+            res.on('end', () => {
+              try {
+                const response = JSON.parse(body);
+                if (response.choices && response.choices[0]) {
+                  console.log(response.choices[0].message.content);
+                }
+              } catch (e) {
+                console.error('Failed to parse response');
+              }
+            });
+          });
+          req.write(data);
+          req.end();
+          EOF
+          
+          node review.mjs > review_output.txt 2>&1 || true
+      - name: Post review comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let review = fs.readFileSync('review_output.txt', 'utf8') || 'Unable to generate review.';
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## 🤖 GLM AI Code Review (On-Demand)
+            ${review}
+            ---
+            <sub>Powered by GLM-4 | Triggered by @${context.actor}</sub>`
+            });
