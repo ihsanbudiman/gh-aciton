@@ -21,6 +21,12 @@ WORKDIR /app
 # Copy binary from builder
 COPY --from=builder /app/main .
 
+# Copy migrations
+COPY --from=builder /app/migrations ./migrations
+
+# Set migrations directory
+ENV MIGRATIONS_DIR=/app/migrations
+
 # Expose port
 EXPOSE 8080
 
